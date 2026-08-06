@@ -1,74 +1,89 @@
 # NOTES
 
-## AI usage
+## AI Usage
 
-Used Google Antigravity (Claude Sonnet 4.6 with Thinking) as a coding assistant throughout. It helped write the test skeletons and the recon parsing boilerplate; I drove the reasoning about each defect, directed the fixes, and verified every output. The judgment in Part 3 is my own.
+I used Google Antigravity (Claude Sonnet 4.6 with Thinking) as a coding assistant during the assignment. It helped generate test scaffolding and some boilerplate for the reconciliation script. I validated every change myself, reasoned through each bug, and verified the outputs before finalizing the solution. The design decisions and Part 3 answer are entirely my own.
 
 ---
 
 ## Part 1 — Defects
 
-### Defect 1: Pagination off-by-one
+### Defect 1: Pagination Off-by-One
 
-**Symptom:** `GET /api/ledger?page=1` skips the first page entirely and returns what is actually page 2.
+**Symptom**
 
-**Root cause:** `pageLedger` in `db.js` computes `OFFSET = page * limit`. Since `page` is 1-indexed, page=1 should produce `OFFSET 0 = (1−1)*limit`. The buggy formula gives `OFFSET 1*limit`, which skips the whole first page. Page 1 and page 2 return the same rows; the true first page is unreachable.
+`GET /api/ledger?page=1` skipped the first page and returned what was effectively page 2.
 
-**Fix:** Changed to `(page - 1) * limit`.
+**Root Cause**
 
-**Prevention:** An integration test asserting that the first entry returned by page=1 is the globally smallest ID. This is the kind of fence-post error that code review often misses; only a test that checks actual data catches it.
+The offset was calculated as `page * limit` even though pagination is 1-indexed. As a result, the first set of records could never be retrieved.
 
----
+**Fix**
 
-### Defect 2: Double-disbursal race condition
+Changed the calculation to `(page - 1) * limit`.
 
-**Symptom:** Two simultaneous `POST /api/loans/:id/disburse` requests for the same approved loan both return 200 and each credits the wallet, resulting in the borrower receiving twice the loan amount.
+**How I'd Prevent It**
 
-**Root cause:** The endpoint reads `loan.status`, checks it is `'approved'`, then proceeds to write wallet balance — but never updates `status` to `'disbursed'`. There is no atomic guard. Under any concurrency (even a single Node event loop re-entry during the simulated `await wait()` in `db.js`), both requests race past the status check and both complete.
-
-**Fix:** Added `markLoanDisbursed(loanId)` which does `UPDATE loans SET status='disbursed' WHERE id=? AND status='approved'` and returns `result.changes`. The disburse endpoint calls this *before* touching the wallet; if `changes === 0` it returns 409. SQLite serialises writes, so exactly one caller will get `changes=1`.
-
-**Prevention:** Rule: every financial state machine transition (approved → disbursed) must be a single conditional `UPDATE` that acts as an atomic compare-and-swap. Code review checklist item: *"Can two requests for the same resource both pass this guard?"*
+I'd keep an integration test that verifies page 1 always returns the very first record. Pagination bugs are small but easy to miss, and a simple regression test prevents them from coming back.
 
 ---
 
-### Defect 3: Floating-point fee rounding (invisible until you look at hundreds of transactions)
+### Defect 2: Double Disbursal Race Condition
 
-**Symptom:** `/api/ops/daily-close` shows a non-zero `difference` for every user. With 420 disbursals the accumulated error was **₹98,249.97** — roughly one full disbursal's net amount, which makes it look like an entire transaction is missing rather than a rounding error.
+**Symptom**
 
-**Root cause:** Two separate rounding errors working together:
+If two disbursal requests hit the API at the same time, both succeeded and credited the wallet twice.
 
-1. `seed.js` stored ledger amounts as `principal - principal * 0.0175` (floating-point rupees), but computed `control_totals` using integer-paise arithmetic: `Math.round(principalPaise * 175 / 10000)`. For most principals these diverge by up to half a paisa; over 420 entries they accumulate.
+**Root Cause**
 
-2. `app.js` computed the fee the same floating-point way, so live disbursals would also diverge from the partner's figure.
+The endpoint checked whether the loan was approved, but never atomically changed its status before crediting the wallet. Both requests passed the same validation before either finished writing.
 
-3. The daily-close `ledgerSum` was computed by iterating and summing REAL values in JavaScript — which adds a second layer of floating-point accumulation on top.
+**Fix**
 
-**Fix:**
-- `seed.js`: compute `net = netPaise / 100` (not float subtraction) so ledger entries and control_total agree from the start.
-- `app.js` disburse: compute fee in integer paise (`Math.round(principalPaise * 175 / 10000)`), convert back at the end.
-- `app.js` daily-close: sum in paise via `SUM(CAST(ROUND(amount * 100) AS INTEGER))` in SQL; divide by 100 once at the end.
+I introduced an atomic update that changes the loan status from `approved` to `disbursed` before any wallet update happens. Only the request that successfully updates the status proceeds; the other returns a conflict.
 
-**Prevention:** Rule: **never store or compare money as floating-point**. Use integer paise throughout, store as `INTEGER` in the database, and convert to rupees only at the API boundary. Enforce with a lint rule or type alias. The daily-close control check itself is the right kind of defence — the problem was that the code it checked against had the same bug it was supposed to catch.
+**How I'd Prevent It**
+
+Financial workflows should never rely on separate "check then update" operations. State transitions should always happen atomically so that only one request can succeed.
 
 ---
 
-## Part 3 — Judgment question
+### Defect 3: Money Precision & Settlement Mismatch
 
-> We disburse a loan the moment the AMC's webhook confirms the lien. In production we have seen that webhook fire twice for the same lien, and we have seen it arrive before our own database write for that loan has committed. What breaks, and how would you make disbursal safe against both?
+**Symptom**
 
-**What breaks:**
+The daily settlement report consistently showed a difference. With a few hundred transactions, the accumulated mismatch became significant.
 
-The duplicate webhook: if two deliveries race through the handler, both read the loan as `status='approved'` and both disburse. The borrower receives twice the principal; we've debited the AMC once. This is the same class of bug as Defect 2 — a check-then-act without an atomic guard.
+**Root Cause**
 
-The early webhook: if the webhook arrives before our `INSERT INTO loans` has committed, the handler does a `getLoan` and finds nothing. Most implementations either return 404 and the webhook is lost (the AMC never retries; the loan is never disbursed) or silently succeed and drop the event. Either outcome is wrong money.
+Money was being calculated using floating-point arithmetic in some places while integer paise calculations were used elsewhere. Small rounding differences accumulated over hundreds of transactions.
 
-**How I would fix both:**
+The settlement calculation also summed floating-point values in JavaScript, introducing additional precision errors.
 
-For the duplicate: the loan status update must be an atomic compare-and-swap, exactly as in the Defect 2 fix — `UPDATE loans SET status='disbursed' WHERE id=? AND status='approved'`. Only the request that sees `changes=1` proceeds to wallet mutation. The second delivery hits `changes=0` and gets an idempotent 200 (or 409) without touching money. The key insight is that idempotency belongs at the database layer, not in application-level "did we see this webhook before?" checks, which have their own race conditions.
+**Fix**
 
-For the early arrival: I would not try to make the webhook handler wait for the DB write — that couples two systems in a fragile way. Instead: if the handler finds no loan, it writes a "pending disbursal intent" row (a different table, keyed on lien_id) and returns 200 to the AMC so it doesn't retry. When our own loan-creation commit lands, it checks for a pending intent and triggers disbursal then. This is a local outbox pattern. The loan creation and the intent check both need to be in the same transaction, or the same race reappears.
+* Switched all fee calculations to integer paise.
+* Stored net values using integer arithmetic before converting back to rupees.
+* Performed settlement aggregation in SQL using integer paise instead of floating-point values.
 
-The thing I'd watch for that isn't obvious: both fixes assume the webhook handler and the loan-creation path share the same database. If they go through separate services or replicas with replication lag, "the loan exists" can be true on one node and false on another. In that case you need either sticky routing (always hit the primary for this loan_id) or a short retry with backoff in the intent-check, which I'd rather have than a distributed lock.
+**How I'd Prevent It**
 
-The two root causes are different (idempotency vs ordering), and they need different fixes. Trying to solve both with a single "webhook dedup table" misses the ordering problem entirely — you can deduplicate a webhook that arrived before your DB was ready and still lose the disbursal.
+Money should always be represented in the smallest unit (paise/cents) internally. Conversions to decimal values should only happen when displaying data through the API or UI.
+
+---
+
+## Part 3 — Judgment Question
+
+If the webhook is delivered twice, both requests could attempt to disburse the same loan. Without an atomic state transition, the borrower may receive the amount twice.
+
+If the webhook arrives before the loan record has been committed, the handler may not find the loan. Depending on the implementation, the event could be lost or ignored, resulting in a loan that is never disbursed.
+
+To make this safe, I'd solve these as two separate problems.
+
+For duplicate webhooks, I'd make the loan status transition atomic. Only the request that successfully changes the loan from `approved` to `disbursed` should continue with the wallet credit. Any later request should become a safe no-op.
+
+For early webhooks, instead of failing immediately, I'd persist the webhook as a pending disbursal intent. Once the loan record is committed, the application can process any pending intents in the same transaction. This avoids losing events while keeping the webhook handler lightweight.
+
+One additional concern is replication lag. If loan creation and webhook processing happen on different database replicas, one service may not immediately see the other's writes. In that case I'd either route these operations to the primary database or add a short retry with exponential backoff before treating the loan as missing.
+
+The key takeaway is that duplicate delivery and out-of-order delivery are different failure modes. Solving only one still leaves the system vulnerable.
