@@ -73,11 +73,7 @@ function allLedger(userId) {
     .all(userId);
 }
 
-/**
- * Atomically flips loan status from 'approved' to 'disbursed'.
- * Returns the number of rows changed — 1 means the caller won the race,
- * 0 means another request already disbursed (or the loan was never approved).
- */
+// Atomically transition status from approved to disbursed
 function markLoanDisbursed(loanId) {
   const result = db
     .prepare("UPDATE loans SET status = 'disbursed' WHERE id = ? AND status = 'approved'")

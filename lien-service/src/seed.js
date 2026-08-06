@@ -41,14 +41,12 @@ function seed({ users = 3, disbursalsPerUser = 420 } = {}) {
       const principal = Math.round((25000 + rnd() * 475000) * 100) / 100;
       insertLoan.run(loanId, u, principal, 0.135, 'disbursed');
 
-      // Partner computes in integer paise and rounds half-up per transaction.
+      // Calculate fee in integer paise to align with partner calculations
       const principalPaise = Math.round(principal * 100);
       const feePaise = Math.round(principalPaise * 175 / 10000);
       const netPaise = principalPaise - feePaise;
       controlPaise += netPaise;
 
-      // Store the ledger amount in the same unit (paise → rupees) so that
-      // the daily-close sum matches the banking partner's figure exactly.
       const net = netPaise / 100;
       const ts = new Date(Date.UTC(2026, 6, 1 + (i % 28), 4, i % 60, 0)).toISOString();
       insertLedger.run(u, loanId, 'disbursal', net, ts);

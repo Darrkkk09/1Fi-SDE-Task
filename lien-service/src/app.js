@@ -28,18 +28,13 @@ function build() {
       return res.status(409).json({ error: `loan is ${loan.status}` });
     }
 
-    // Atomically claim this loan before touching money.
-    // If two requests race here, only one will see changes=1; the other gets 0
-    // and is rejected before any wallet mutation occurs.
+    // Ensure atomic update of loan status to prevent race conditions / double disbursal
     const claimed = store.markLoanDisbursed(loanId);
     if (!claimed) {
       return res.status(409).json({ error: 'loan is already disbursed' });
     }
 
-    // Compute fee in integer paise to match the banking partner's rounding
-    // (seed.js: Math.round(principalPaise * 175 / 10000)).
-    // Floating-point arithmetic on rupees accumulates a systematic error over
-    // hundreds of transactions that shows up in the daily-close control check.
+    // Calculate fee in integer paise to avoid float rounding discrepancies
     const principalPaise = Math.round(loan.principal * 100);
     const feePaise = Math.round(principalPaise * 175 / 10000);
     const netPaise = principalPaise - feePaise;
@@ -107,9 +102,7 @@ function build() {
     const userId = Number(req.query.user_id);
     const entries = store.allLedger(userId);
 
-    // Sum in integer paise to avoid accumulated floating-point error.
-    // Each amount was stored as (netPaise / 100); ROUND(amount * 100) recovers
-    // the exact paise integer that the banking partner also used.
+    // Sum in integer paise to avoid precision accumulation issues
     const row = store.db
       .prepare('SELECT COUNT(*) AS n, SUM(CAST(ROUND(amount * 100) AS INTEGER)) AS paise FROM ledger WHERE user_id = ?')
       .get(userId);
